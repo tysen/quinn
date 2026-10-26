@@ -48,7 +48,7 @@ use cid_state::CidState;
 
 mod datagrams;
 use datagrams::DatagramState;
-pub use datagrams::{Datagrams, SendDatagramError};
+pub use datagrams::{DatagramOutcome, Datagrams, MAX_DATAGRAM_OUTCOMES, SendDatagramError};
 
 mod mtud;
 mod pacing;
@@ -1621,6 +1621,7 @@ impl Connection {
             return false;
         }
 
+        let mut late_datagrams = Vec::new();
         for range in ack.iter() {
             let spurious_losses: Vec<u64> = lost_packets
                 .range(range.clone())
@@ -1629,15 +1630,19 @@ impl Connection {
                 .collect();
 
             for pn in spurious_losses {
-                lost_packets.remove(&pn);
+                if let Some(tags) = lost_packets.remove(&pn).and_then(|info| info.datagram_tags) {
+                    late_datagrams.extend(tags);
+                }
             }
         }
+        let all_lost_acked = self.spaces[space].lost_packets.is_empty();
+        self.report_datagrams(late_datagrams, DatagramOutcome::AckedAfterLoss);
 
         // If this ACK frame acknowledged all deemed lost packets,
         // then we have raised a spurious congestion event in the past.
         // We cannot conclude when there are remaining packets,
         // but future ACK frames might indicate a spurious loss detection.
-        lost_packets.is_empty()
+        all_lost_acked
     }
 
     /// Drain lost packets that we reasonably think will never arrive
@@ -1678,10 +1683,24 @@ impl Connection {
         }
     }
 
+    /// Queue `outcome` for each tag, waking the application if none were waiting
+    fn report_datagrams(&mut self, tags: impl IntoIterator<Item = u64>, outcome: DatagramOutcome) {
+        let mut ready = false;
+        for tag in tags {
+            ready |= self.datagrams.report(tag, outcome);
+        }
+        if ready {
+            self.events.push_back(Event::DatagramOutcomes);
+        }
+    }
+
     // Not timing-aware, so it's safe to call this for inferred acks, such as arise from
     // high-latency handshakes
     fn on_packet_acked(&mut self, now: Instant, info: SentPacket) {
         self.remove_in_flight(&info);
+        if let Some(tags) = &info.datagram_tags {
+            self.report_datagrams(tags.iter().copied(), DatagramOutcome::Acked);
+        }
         if info.ack_eliciting && self.path.challenge.is_none() {
             // Only pass ACKs to the congestion controller if we are not validating the current
             // path, so as to ignore any ACKs from older paths still coming in.
@@ -1866,10 +1885,14 @@ impl Connection {
                 self.spaces[pn_space].pending |= info.retransmits;
                 self.path.mtud.on_non_probe_lost(packet, info.size);
 
+                if let Some(tags) = &info.datagram_tags {
+                    self.report_datagrams(tags.iter().copied(), DatagramOutcome::Lost);
+                }
                 self.spaces[pn_space].lost_packets.insert(
                     packet,
                     LostPacket {
                         time_sent: info.time_sent,
+                        datagram_tags: info.datagram_tags,
                     },
                 );
             }
@@ -3509,7 +3532,7 @@ impl Connection {
         // DATAGRAM
         let mut sent_datagrams = false;
         while buf.len() + Datagram::SIZE_BOUND < max_size && space_id == SpaceId::Data {
-            match self.datagrams.write(buf, max_size) {
+            match self.datagrams.write(buf, max_size, &mut sent.datagram_tags) {
                 true => {
                     sent_datagrams = true;
                     sent.non_retransmits = true;
@@ -4233,6 +4256,8 @@ pub enum Event {
     DatagramReceived,
     /// One or more application datagrams have been sent after blocking
     DatagramsUnblocked,
+    /// Outcomes of tagged datagrams are ready for [`Datagrams::poll_outcome`]
+    DatagramOutcomes,
     /// The currently active path was updated
     PathUpdated,
 }
@@ -4285,6 +4310,8 @@ struct SentFrames {
     /// Whether the packet contains non-retransmittable frames (like datagrams)
     non_retransmits: bool,
     requires_padding: bool,
+    /// Tags of the tagged datagrams in the packet
+    datagram_tags: Vec<u64>,
 }
 
 impl SentFrames {

@@ -32,8 +32,8 @@ use crate::{
     udp_transmit,
 };
 use proto::{
-    ConnectionError, ConnectionHandle, ConnectionStats, Dir, EndpointEvent, Side, StreamEvent,
-    StreamId, TransportError, TransportErrorCode, congestion::Controller,
+    ConnectionError, ConnectionHandle, ConnectionStats, DatagramOutcome, Dir, EndpointEvent, Side,
+    StreamEvent, StreamId, TransportError, TransportErrorCode, congestion::Controller,
 };
 
 /// In-progress connection attempt future
@@ -530,6 +530,47 @@ impl Connection {
         }
     }
 
+    /// Transmit `data` as [`send_datagram()`] does, and report what becomes of it under `tag`
+    ///
+    /// Each tagged datagram yields one [`DatagramOutcome`] through
+    /// [`read_datagram_outcomes()`], plus a later `AckedAfterLoss` if a packet declared lost
+    /// is acknowledged after all.
+    ///
+    /// [`send_datagram()`]: Connection::send_datagram
+    /// [`read_datagram_outcomes()`]: Connection::read_datagram_outcomes
+    pub fn send_datagram_tagged(&self, tag: u64, data: Bytes) -> Result<(), SendDatagramError> {
+        let conn = &mut *self.0.state.lock("send_datagram_tagged");
+        if let Some(x) = &conn.error {
+            return Err(SendDatagramError::ConnectionLost(x.clone()));
+        }
+        use proto::SendDatagramError::*;
+        match conn.inner.datagrams().send_tagged(data, tag, true) {
+            Ok(()) => {
+                conn.wake();
+                Ok(())
+            }
+            Err(e) => Err(match e {
+                Blocked(..) => unreachable!(),
+                UnsupportedByPeer => SendDatagramError::UnsupportedByPeer,
+                Disabled => SendDatagramError::Disabled,
+                TooLarge => SendDatagramError::TooLarge,
+            }),
+        }
+    }
+
+    /// Wait for outcomes of datagrams sent with [`send_datagram_tagged()`], and take every one
+    /// unread, oldest first
+    ///
+    /// Past [`proto::MAX_DATAGRAM_OUTCOMES`] unread, the oldest are discarded.
+    ///
+    /// [`send_datagram_tagged()`]: Connection::send_datagram_tagged
+    pub fn read_datagram_outcomes(&self) -> ReadDatagramOutcomes<'_> {
+        ReadDatagramOutcomes {
+            conn: &self.0,
+            notify: self.0.shared.datagram_outcomes.notified(),
+        }
+    }
+
     /// Transmit `data` as an unreliable, unordered application datagram
     ///
     /// Unlike [`send_datagram()`], this method will wait for buffer space during congestion
@@ -953,6 +994,40 @@ impl Future for ReadDatagram<'_> {
 }
 
 pin_project! {
+    /// Future produced by [`Connection::read_datagram_outcomes`]
+    pub struct ReadDatagramOutcomes<'a> {
+        conn: &'a ConnectionRef,
+        #[pin]
+        notify: Notified<'a>,
+    }
+}
+
+impl Future for ReadDatagramOutcomes<'_> {
+    type Output = Result<Vec<(u64, DatagramOutcome)>, ConnectionError>;
+    fn poll(self: Pin<&mut Self>, ctx: &mut Context<'_>) -> Poll<Self::Output> {
+        let mut this = self.project();
+        let mut state = this.conn.state.lock("ReadDatagramOutcomes::poll");
+        let outcomes: Vec<_> =
+            std::iter::from_fn(|| state.inner.datagrams().poll_outcome()).collect();
+        if !outcomes.is_empty() {
+            return Poll::Ready(Ok(outcomes));
+        } else if let Some(e) = &state.error {
+            return Poll::Ready(Err(e.clone()));
+        }
+        loop {
+            match this.notify.as_mut().poll(ctx) {
+                // `state` lock ensures we didn't race with readiness
+                Poll::Pending => return Poll::Pending,
+                // Spurious wakeup, get a new future
+                Poll::Ready(()) => this
+                    .notify
+                    .set(this.conn.shared.datagram_outcomes.notified()),
+            }
+        }
+    }
+}
+
+pin_project! {
     /// Future produced by [`Connection::send_datagram_wait`]
     pub struct SendDatagram<'a> {
         conn: &'a ConnectionRef,
@@ -1077,6 +1152,7 @@ pub(crate) struct Shared {
     stream_incoming: [Notify; 2],
     datagram_received: Notify,
     datagrams_unblocked: Notify,
+    datagram_outcomes: Notify,
     closed: Notify,
     connected: Arc<Notify>,
     /// Number of live handles that can used to initiate or handle I/O; excludes the driver
@@ -1279,6 +1355,9 @@ impl State {
                 DatagramsUnblocked => {
                     shared.datagrams_unblocked.notify_waiters();
                 }
+                DatagramOutcomes => {
+                    shared.datagram_outcomes.notify_waiters();
+                }
                 Stream(StreamEvent::Readable { id }) => wake_stream(id, &mut self.blocked_readers),
                 Stream(StreamEvent::Available { dir }) => {
                     // Might mean any number of streams are ready, so we wake up everyone
@@ -1365,6 +1444,7 @@ impl State {
         shared.stream_incoming[Dir::Bi as usize].notify_waiters();
         shared.datagram_received.notify_waiters();
         shared.datagrams_unblocked.notify_waiters();
+        shared.datagram_outcomes.notify_waiters();
         shared.handshake_confirmed.notify_waiters();
         wake_all_notify(&mut self.stopped);
         shared.closed.notify_waiters();

@@ -230,6 +230,8 @@ impl PacketBuilder {
             ack_eliciting,
             retransmits: sent.retransmits,
             stream_frames: sent.stream_frames,
+            datagram_tags: (!sent.datagram_tags.is_empty())
+                .then(|| sent.datagram_tags.into_boxed_slice()),
         };
 
         conn.path

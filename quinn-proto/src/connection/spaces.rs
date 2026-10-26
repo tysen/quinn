@@ -309,6 +309,8 @@ pub(super) struct SentPacket {
     ///
     /// The actual application data is stored with the stream state.
     pub(super) stream_frames: frame::StreamMetaVec,
+    /// Tags of the tagged datagrams in the packet
+    pub(super) datagram_tags: Option<Box<[u64]>>,
 }
 
 /// Represents one or more packets that are deemed lost.
@@ -316,6 +318,8 @@ pub(super) struct SentPacket {
 pub(super) struct LostPacket {
     /// The time the packet was sent.
     pub(super) time_sent: Instant,
+    /// Tags of the tagged datagrams in the packet, reported again if it is acknowledged late
+    pub(super) datagram_tags: Option<Box<[u64]>>,
 }
 
 /// Retransmittable data queue
