@@ -226,6 +226,10 @@ pub struct Connection {
     //
     /// The number of times a PTO has been sent without receiving an ack.
     pto_count: u32,
+    /// Time based loss detection's threshold as a factor of RTT, widened on a path that reorders
+    reorder: f32,
+    /// When `reorder` was last widened or eased, while it sits above the configured threshold
+    reorder_since: Option<Instant>,
 
     //
     // Congestion Control
@@ -350,6 +354,8 @@ impl Connection {
             next_bundled_ack_time: None,
 
             pto_count: 0,
+            reorder: config.time_threshold,
+            reorder_since: None,
 
             app_limited: false,
             receiving_ecn: false,
@@ -1515,7 +1521,7 @@ impl Connection {
             }
         };
 
-        if self.detect_spurious_loss(&ack, space) {
+        if self.detect_spurious_loss(now, &ack, space) {
             self.stats.path.spurious_congestion_events += 1;
             self.path.congestion.on_spurious_congestion_event();
         }
@@ -1614,7 +1620,7 @@ impl Connection {
         Ok(())
     }
 
-    fn detect_spurious_loss(&mut self, ack: &frame::Ack, space: SpaceId) -> bool {
+    fn detect_spurious_loss(&mut self, now: Instant, ack: &frame::Ack, space: SpaceId) -> bool {
         let lost_packets = &mut self.spaces[space].lost_packets;
 
         if lost_packets.is_empty() {
@@ -1622,6 +1628,7 @@ impl Connection {
         }
 
         let mut late_datagrams = Vec::new();
+        let mut earliest_sent: Option<Instant> = None;
         for range in ack.iter() {
             let spurious_losses: Vec<u64> = lost_packets
                 .range(range.clone())
@@ -1630,12 +1637,20 @@ impl Connection {
                 .collect();
 
             for pn in spurious_losses {
-                if let Some(tags) = lost_packets.remove(&pn).and_then(|info| info.datagram_tags) {
+                let Some(info) = lost_packets.remove(&pn) else {
+                    continue;
+                };
+                earliest_sent =
+                    Some(earliest_sent.map_or(info.time_sent, |t| t.min(info.time_sent)));
+                if let Some(tags) = info.datagram_tags {
                     late_datagrams.extend(tags);
                 }
             }
         }
         let all_lost_acked = self.spaces[space].lost_packets.is_empty();
+        if let Some(sent) = earliest_sent {
+            self.widen_reorder(now, sent);
+        }
         self.report_datagrams(late_datagrams, DatagramOutcome::AckedAfterLoss);
 
         // If this ACK frame acknowledged all deemed lost packets,
@@ -1643,6 +1658,38 @@ impl Connection {
         // We cannot conclude when there are remaining packets,
         // but future ACK frames might indicate a spurious loss detection.
         all_lost_acked
+    }
+
+    /// A packet sent at `sent` and declared lost was acknowledged at `now`: with an adaptive
+    /// threshold, widen it so a packet delayed that long is not declared lost again.
+    fn widen_reorder(&mut self, now: Instant, sent: Instant) {
+        let Some(max) = self.config.adaptive_time_threshold else {
+            return;
+        };
+        let rtt = self.path.rtt.conservative().as_secs_f32();
+        if rtt <= 0.0 {
+            return;
+        }
+        let seen = now.saturating_duration_since(sent).as_secs_f32() / rtt * REORDER_MARGIN;
+        self.reorder = self.reorder.max(seen).min(max);
+        self.reorder_since = Some(now);
+    }
+
+    /// Halve a widened threshold's excess each [`REORDER_CALM`] without a spurious loss.
+    fn ease_reorder(&mut self, now: Instant) {
+        let Some(since) = self.reorder_since else {
+            return;
+        };
+        if now.saturating_duration_since(since) < REORDER_CALM {
+            return;
+        }
+        let base = self.config.time_threshold;
+        let eased = base + (self.reorder - base) / 2.0;
+        (self.reorder, self.reorder_since) = if eased - base < REORDER_SETTLED {
+            (base, None)
+        } else {
+            (eased, Some(now))
+        };
     }
 
     /// Drain lost packets that we reasonably think will never arrive
@@ -1780,7 +1827,8 @@ impl Connection {
         let mut lost_mtu_probe = None;
         let in_flight_mtu_probe = self.path.mtud.in_flight_mtu_probe();
         let rtt = self.path.rtt.conservative();
-        let loss_delay = cmp::max(rtt.mul_f32(self.config.time_threshold), TIMER_GRANULARITY);
+        self.ease_reorder(now);
+        let loss_delay = cmp::max(rtt.mul_f32(self.reorder), TIMER_GRANULARITY);
 
         let largest_acked_packet = self.spaces[pn_space].largest_acked_packet.unwrap();
         let packet_threshold = self.config.packet_threshold as u64;
@@ -1936,7 +1984,10 @@ impl Connection {
     }
 
     fn pto_time_and_space(&self, now: Instant) -> Option<(Instant, SpaceId)> {
-        let backoff = 2u32.pow(self.pto_count.min(MAX_BACKOFF_EXPONENT));
+        let backoff = 2u32.pow(
+            self.pto_count
+                .min(self.config.max_pto_backoff.min(MAX_BACKOFF_EXPONENT)),
+        );
         let mut duration = self.path.rtt.pto_base() * backoff;
 
         if self.path.in_flight.ack_eliciting == 0 {
@@ -4267,7 +4318,14 @@ fn get_max_ack_delay(params: &TransportParameters) -> Duration {
 }
 
 // Prevents overflow and improves behavior in extreme circumstances
-const MAX_BACKOFF_EXPONENT: u32 = 16;
+pub(crate) const MAX_BACKOFF_EXPONENT: u32 = 16;
+
+/// Headroom over the delay a spuriously lost packet saw when widening the time threshold
+const REORDER_MARGIN: f32 = 9.0 / 8.0;
+/// Time without a spurious loss before a widened time threshold eases back
+const REORDER_CALM: Duration = Duration::from_secs(10);
+/// How close to the configured threshold an easing one snaps back to it
+const REORDER_SETTLED: f32 = 0.01;
 
 /// Maximum number of 1-RTT packets buffered while the handshake completes
 const MAX_EARLY_1RTT_PACKETS: usize = 16;

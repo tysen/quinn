@@ -9,7 +9,7 @@ use qlog::streamer::QlogStreamer;
 use crate::QlogStream;
 use crate::{
     Duration, INITIAL_MTU, MAX_UDP_PAYLOAD, VarInt, VarIntBoundsExceeded, congestion,
-    connection::qlog::QlogSink,
+    connection::{MAX_BACKOFF_EXPONENT, qlog::QlogSink},
 };
 
 /// Parameters governing the core QUIC state machine
@@ -35,6 +35,8 @@ pub struct TransportConfig {
 
     pub(crate) packet_threshold: u32,
     pub(crate) time_threshold: f32,
+    pub(crate) adaptive_time_threshold: Option<f32>,
+    pub(crate) max_pto_backoff: u32,
     pub(crate) initial_rtt: Duration,
     pub(crate) initial_mtu: u16,
     pub(crate) min_mtu: u16,
@@ -171,6 +173,20 @@ impl TransportConfig {
     /// as a factor of RTT
     pub fn time_threshold(&mut self, value: f32) -> &mut Self {
         self.time_threshold = value;
+        self
+    }
+
+    /// Up to `max` × RTT, widen the time threshold to the delay a packet declared lost then acked
+    /// saw; ten calm seconds halve the widening. `None` (the default) keeps it fixed.
+    pub fn adaptive_time_threshold(&mut self, max: Option<f32>) -> &mut Self {
+        self.adaptive_time_threshold = max;
+        self
+    }
+
+    /// The most times the probe timeout doubles while probes go unacknowledged; lower resumes
+    /// sooner after an outage. Defaults to 16.
+    pub fn max_pto_backoff(&mut self, value: u32) -> &mut Self {
+        self.max_pto_backoff = value;
         self
     }
 
@@ -390,6 +406,8 @@ impl Default for TransportConfig {
 
             packet_threshold: 3,
             time_threshold: 9.0 / 8.0,
+            adaptive_time_threshold: None,
+            max_pto_backoff: MAX_BACKOFF_EXPONENT,
             initial_rtt: Duration::from_millis(333), // per spec, intentionally distinct from EXPECTED_RTT
             initial_mtu: INITIAL_MTU,
             min_mtu: INITIAL_MTU,
@@ -428,6 +446,8 @@ impl fmt::Debug for TransportConfig {
             send_fairness,
             packet_threshold,
             time_threshold,
+            adaptive_time_threshold,
+            max_pto_backoff,
             initial_rtt,
             initial_mtu,
             min_mtu,
@@ -458,6 +478,8 @@ impl fmt::Debug for TransportConfig {
             .field("send_fairness", send_fairness)
             .field("packet_threshold", packet_threshold)
             .field("time_threshold", time_threshold)
+            .field("adaptive_time_threshold", adaptive_time_threshold)
+            .field("max_pto_backoff", max_pto_backoff)
             .field("initial_rtt", initial_rtt)
             .field("initial_mtu", initial_mtu)
             .field("min_mtu", min_mtu)
