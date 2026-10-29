@@ -101,12 +101,15 @@ impl Datagrams<'_> {
             dropped.into_iter().flatten(),
             DatagramOutcome::DroppedUnsent,
         );
-        if !dropped_any || !self.conn.datagrams.send_blocked {
+        if !dropped_any {
             return;
         }
 
-        self.conn.datagrams.send_blocked = false;
-        self.conn.events.push_back(Event::DatagramsUnblocked);
+        if self.conn.datagrams.send_blocked {
+            self.conn.datagrams.send_blocked = false;
+            self.conn.events.push_back(Event::DatagramsUnblocked);
+        }
+        self.conn.events.push_back(Event::DatagramSpaceFreed);
     }
 
     /// Compute the maximum size of datagrams that may passed to `send_datagram`
@@ -142,7 +145,8 @@ impl Datagrams<'_> {
     /// Bytes available in the outgoing datagram buffer
     ///
     /// When greater than zero, [`send`](Self::send)ing a datagram of at most this size is
-    /// guaranteed not to cause older datagrams to be dropped.
+    /// guaranteed not to cause older datagrams to be dropped. `Event::DatagramSpaceFreed` is
+    /// emitted when queued datagrams leave the buffer.
     pub fn send_buffer_space(&self) -> usize {
         self.conn
             .config

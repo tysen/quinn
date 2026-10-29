@@ -620,6 +620,16 @@ impl Connection {
             .send_buffer_space()
     }
 
+    /// Wait for space to be freed in the outgoing datagram buffer
+    ///
+    /// Resolves once queued datagrams leave the buffer, sent or dropped as too large for the
+    /// path, or the connection is lost. Only space freed after this is called wakes it, so call
+    /// it before checking [`datagram_send_buffer_space()`](Self::datagram_send_buffer_space)
+    /// and await it if the space was too little: a drain in between is not missed.
+    pub fn datagram_space_freed(&self) -> Notified<'_> {
+        self.0.shared.datagram_space_freed.notified()
+    }
+
     /// The side of the connection (client or server)
     pub fn side(&self) -> Side {
         self.0.state.lock("side").inner.side()
@@ -1152,6 +1162,7 @@ pub(crate) struct Shared {
     stream_incoming: [Notify; 2],
     datagram_received: Notify,
     datagrams_unblocked: Notify,
+    datagram_space_freed: Notify,
     datagram_outcomes: Notify,
     closed: Notify,
     connected: Arc<Notify>,
@@ -1355,6 +1366,9 @@ impl State {
                 DatagramsUnblocked => {
                     shared.datagrams_unblocked.notify_waiters();
                 }
+                DatagramSpaceFreed => {
+                    shared.datagram_space_freed.notify_waiters();
+                }
                 DatagramOutcomes => {
                     shared.datagram_outcomes.notify_waiters();
                 }
@@ -1444,6 +1458,7 @@ impl State {
         shared.stream_incoming[Dir::Bi as usize].notify_waiters();
         shared.datagram_received.notify_waiters();
         shared.datagrams_unblocked.notify_waiters();
+        shared.datagram_space_freed.notify_waiters();
         shared.datagram_outcomes.notify_waiters();
         shared.handshake_confirmed.notify_waiters();
         wake_all_notify(&mut self.stopped);

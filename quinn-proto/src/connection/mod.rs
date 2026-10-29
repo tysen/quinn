@@ -3596,6 +3596,9 @@ impl Connection {
             self.events.push_back(Event::DatagramsUnblocked);
             self.datagrams.send_blocked = false;
         }
+        if sent_datagrams {
+            self.events.push_back(Event::DatagramSpaceFreed);
+        }
 
         // NEW_TOKEN
         while let Some(remote_addr) = space.pending.new_tokens.pop() {
@@ -4307,6 +4310,9 @@ pub enum Event {
     DatagramReceived,
     /// One or more application datagrams have been sent after blocking
     DatagramsUnblocked,
+    /// Space was freed in the outgoing datagram buffer: queued datagrams were sent, or dropped
+    /// as too large for the path
+    DatagramSpaceFreed,
     /// Outcomes of tagged datagrams are ready for [`Datagrams::poll_outcome`]
     DatagramOutcomes,
     /// The currently active path was updated
